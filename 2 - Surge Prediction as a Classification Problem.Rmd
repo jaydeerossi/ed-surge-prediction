@@ -1,0 +1,318 @@
+---
+title: "Surge Prediction as Classification Problem"
+author: "Jack Rossi"
+date: "June 14, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Summary
+
+The objective of the following is to explore the operational Surge prediction problem through the lens of statistical classification. The method evaluated in the following can serve as augmentation or replacement to the regression-style methods previously proposed. The first task is to justify the framing of the surge problem in this way. A necessary condition for this is a well-accepted diagnosis result (classifier). I will try to correlate candidate-classifiers to operational metrics associated with Surge outcomes. I will then develop the code to produce ROC curves, which will qualify metrics to predict the best classifier.
+
+```{r preload, echo = FALSE}
+#preload functions
+
+#library("knitr")
+library("ggplot2")
+library("plyr")
+library("ROCR")
+
+get_rooms <- function(hour){
+  
+  if(hour%%24 >= 0){
+    hour = hour%%24
+    }
+  
+  if(hour %in% c(11,12,13,14,15,16,17,18,19,20,21,22,23,24,0)){
+    Rooms = 42}
+  else if (hour == 1){
+    Rooms = 32}
+  else if (hour %in% c(2, 3)){
+    Rooms = 25}
+  else if (hour %in% c(4, 5, 6, 7, 8)){
+    Rooms = 22} 
+  else if (hour == 9){
+    Rooms = 26}
+  else if (hour == 10){
+    Rooms = 36}
+  else {
+    Rooms = NA}
+  
+  return(Rooms)
+}
+
+get_FC_rooms <- function(hrBlock, minBlock, FCHours = 2){
+  #Sum up the number available rooms in the next FChours, weighted by the time spent with those rooms
+  if (FCHours == 1){return(get_rooms(hrBlock))
+  }
+  FCRooms = 0
+  
+  for (g in 1:FCHours){
+    FCRooms = FCRooms + get_rooms(hrBlock + g - 1)*(60-minBlock) + get_rooms(hrBlock + g)*minBlock  
+  }
+  FCRooms = FCRooms/(60*FCHours)
+}
+ 
+# Multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+## Classification of Overcrowding
+
+Surge Planning is concerned with making arrangements for acute ED overcrowding. While overall hospital and ED censuses have continued to rise, past analyses have suggested that the overcrowding is not quite chronic, according to several measures to be discussed. This assertion is especially true as we become concerned with patient volumes of non-peak seasons.  I have previously used Occupancy Rate extensively to identify current overcrowding. In fact, many other measures of ED overcrowding have been found to identify surges in real time, most notably the NEDOCS score, which has a long history of use at CHP. 
+
+It is worth noting that my definition of Occupancy Rate differs, in part by accident, from that found in the original paper I used. The authors' definition more resembles NIS, but as a fraction of the maximum number of licensed beds open in the ED.
+
+Even assuming that my adaptation of the metric is equally valid, it is still unclear what level of Occupancy Rate (or any other metric) constitutes a surge. I have previously used the 1.60 threshold, but this decision was far from rigorous. At the very least I would like to see the correlation between levels of OccRate and some patient satisfaction metric, which informs our initial interest in surge planning. It would also be good to compare these correlations to those in which another metric, like the Occupancy Level defined by Hoot et al., is correlated to the satisfaction metric.
+
+I will first prepare a random, uniform sample of ED times, at which calculations of Occupancy Rate and Occupancy level can be compared with patient satisfaction metrics. 5000 samples were chosen, calculating that this corresponds to about a sample every 20 minutes for two months. 
+
+```{r CreateRandomSample}
+#specify number of samples
+N <- 5000 #
+st <- as.POSIXct("2016-12-4 07:00")
+et <- as.POSIXct("2017-1-29 07:00")
+#calculate diff in time from start to end
+dt <- as.numeric(difftime(et,st,unit="sec"))
+#generate N random, uniform samples from 0 to the diff in time and sort
+ev <- sort(runif(N, 0, dt))
+#add random variates back to start time
+rt <- st + ev
+
+rsched <- data.frame(rt)
+colnames(rsched)[1] <- "Time"
+```
+
+This random sample of ED times will be compared with ED data from 12-4-2016 to 1-29-2017, which is the same data that was and will be used to train regression-based models.
+
+```{r EDDataLoad, echo = FALSE}
+#loading data; formatting date objects
+ED <- read.csv("ALL_DATA.csv", header = TRUE)
+
+colnames(ED)[1] = "Encounter.ID"
+ED$Arrival <- as.POSIXct(ED$Arrival, format = "%m/%d/%Y %I:%M %p")
+ED$Time.Left.ED <- as.POSIXct(ED$Time.Left.ED, format = "%m/%d/%Y %I:%M %p") 
+ED$ED.Room.Time <- as.POSIXct(ED$ED.Room.Time, format = "%m/%d/%Y %I:%M %p")
+ED$Seen.By.Resident <- as.POSIXct(ED$Seen.By.Resident, format = "%m/%d/%Y %I:%M %p")
+ED$Seen.By.Fellow <- as.POSIXct(ED$Seen.By.Fellow, format = "%m/%d/%Y %I:%M %p")
+ED$Seen.By.Attending <- as.POSIXct(ED$Seen.By.Attending, format = "%m/%d/%Y %I:%M %p")
+
+ED <- ED[ED$Arrival < as.POSIXct("2017-3-1") & ED$Arrival > as.POSIXct("2016-12-1"),]
+
+#often there are multiple rows for a single patient
+ED <- ED[!duplicated(ED$Encounter.ID),]
+```
+
+Next we need to specify the patient satisfaction metrics of interest. The first two I will propose acknowledge Chris Guessner's desire to improve the worst-case patient wait times and lengths of stay. That is, at each random sample I will calculate the amount of time that each patient has been waiting (for those in the wait room) and the amount of time each patient has been in the ED (for those already roomed). The 90th percentile of these time differences will represent the worst possible service. The third metric I will propose will use the same calculation of time differences for all those in the waiting room. However, it will sum these for each random sample, representing what I call "cumulative frustration". This metric suggests that 16 patients waiting 30 minutes each is equally indicative of a surge as is 4 patients waiting 120 minutes each. 
+
+The following code executes these calculations, as well as Occupancy Rate and Occupany Level, for comparison. 
+
+```{r CalcMetrics, warning = FALSE}
+#I discovered that many records indicating LOS of over 1000 minutes. I assume that stays over 24 hours are exceedingly rare. Therefore
+#lest I distort the 'Worst Wait' and 'Longest LOS' metrics below, I removed records with LOS above this threshold
+ED <- ED[!is.na(ED$LOS),]
+ED <- ED[ED$LOS <= 24*60,] #== 1440 minutes
+
+#create a time stamp to consistently define the time at which a patient is no longer considered to be in the wait room
+##how can I do this with PLYR?
+for (b in 1:length(ED$Encounter.ID)){
+  ED$First.Touch[b] <- min(ED$ED.Room.Time[b], ED$Seen.By.Fellow[b], ED$Seen.By.Resident[b], ED$Seen.By.Attending[b], na.rm = TRUE)
+}
+
+for (m in 1:length(rsched$Time)){ 
+  WholeED <- ED[!is.na(ED$Arrival) & !is.na(ED$Time.Left.ED) & ED$Arrival <= rsched$Time[m] & ED$Time.Left.ED > rsched$Time[m],]
+  WaitingRoom <- WholeED[WholeED$First.Touch > rsched$Time[m],]
+                           
+                         
+  rsched$NIS[m] <- length(WholeED$Encounter.ID)
+  rsched$NIW[m] <- length(WaitingRoom$Encounter.ID)
+  rsched$NILWBS[m] <- length(WaitingRoom$Encounter.ID[WaitingRoom$First.Touch == Inf])
+  rsched$CumWait[m] <- sum(difftime(rsched$Time[m], WaitingRoom$Arrival,units = "mins" ), na.rm = TRUE)
+  rsched$WorstWait[m] <- quantile(difftime(rsched$Time[m], WaitingRoom$Arrival, units = "mins"), .90, na.rm =TRUE)
+  rsched$LongestLOS[m] <- quantile(difftime(rsched$Time[m], WholeED$Arrival, units = "mins"),  .90, na.rm=TRUE)
+  rsched$Rooms[m] <- get_rooms(as.POSIXlt(rsched$Time[m])$hour)
+}
+
+rsched$OccRate <- rsched$NIS/rsched$Rooms
+rsched$OccLevel <- rsched$NIS/42
+```
+
+```{r classifyDays}
+
+#extract day from sched$Time; adjust to modified day convention
+rsched$Day <- as.POSIXlt(rsched$Time)$yday
+#cycle through each time stamp 
+for (g in 1:length(rsched$Time)){
+  #adjust Day field to reflect modified day convention
+  if (as.POSIXlt(rsched$Time[g])$hour < 7){
+    rsched$Day[g] = rsched$Day[g] - 1
+  }
+}
+
+#January 1st before 7am should be counted as December 31st (365th day).
+rsched$Day[which(rsched$Day == -1)] <- 365
+
+for (j in 1:length(rsched$Time)){
+  if (rsched$Day[j] %in% rsched$Day[rsched$OccRate >= 1.50] ){
+    rsched$Surge[j] = "Surge" 
+  }
+  else{
+    rsched$Surge[j] = "No Surge"
+  }
+}
+```
+
+Among the possible classifiers, we should choose the one that shows the clearest relation to these patient satisfaction metrics. Pearson's correlation coefficient can tell us the amount of linear correspondence, and scatter plots can depict nonlinear relations. The objective is to choose a classifier that separates the patient data into obviously distinct probability distribtuions.  
+
+##Results for Occupancy Rate
+
+```{r echo = FALSE, warning = FALSE}
+#Identify when Max LOS and and Max Waiting time are influenced by LWBS. Not sure how to influence this. 
+#Suppposing we have three numbers: NIW, NIWLWBS, NIS
+#Should we color dot blue for each time sample where NIWLWBS is nonzero?
+cor.test(rsched$OccRate, rsched$CumWait)
+
+```
+
+The Pearson Correlation between Occupancy Rate and Cumulative Frustration is .7351, which I believe to be quite good for human-subject analyses.
+
+```{r echo = FALSE, warning = FALSE}
+ggplot(rsched, aes(OccRate, CumWait)) + geom_point() + facet_grid(.~Surge)
+```
+
+In the first plot, the relation of these two metrics is displayed. The dots correspond to random samples of Cumulative frustration and Occupancy Rate over the two month period, separated by whether or not a Surge (OccRate > 1.50) ultimately occurred on that day. Shown at right, as Occupancy Rate exceeds 1.50, patient dissatisfaction tends to explode towards an ulimate value of 5000. It should be noted that LWBS tend to inflate Cumulative Frustration figures; the worst value ever achieved is probably not so high as 5000. 
+
+```{r echo = FALSE, warning = FALSE}
+ggplot(rsched[rsched$Surge == "Surge",], aes(OccRate, CumWait)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(OccRate, CumWait))
+```
+
+In this next scatterplot where the red Surge days are overlayed on the non-Surge black, we can see that increasing OccRate also increases the variability of the Cumulative Frustration. I believe this to be a strong argument that OccRate > 1.50 effectively identifies two different distributions of this patient satisfaction metric.
+
+Repeating these plots, but with Occupancy Rate and Worst Waiting Time instead, we again get a satisfactory Pearson Correlation, this time at .7147.
+
+```{r echo = FALSE, warning = FALSE}
+cor.test(rsched$OccRate, rsched$WorstWait)
+ggplot(rsched[rsched$Surge == "Surge",], aes(OccRate, WorstWait)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(OccRate, WorstWait))
+ggplot(rsched, aes(OccRate, WorstWait)) + geom_point() + facet_grid(.~Surge)
+
+```
+
+As Occupancy Rate increases in the faceted scatter plots, the distribution of Worst Waits curves upwards, albeit more slowly than Cumulative Wait. This surge criteria does catch the very worst waits we could ever expect to see - over 8 hours. Interestingly, these tend to occur as Surges are waning, once the Occupancy Rate has returned to near 1. 
+
+It would be better if the Non-Surge plot did not include the smattering of dots above 200 minutes. One could argue that we should call in the Surge team if the worst wait gets much worse than 3 hours. However, LWBS often overstate their actual waiting time, and thus, in their presense, an extremely high Worst Wait may not justify a surge team call. The following scatter plot confirms the effect of this tendency: Blue dots correspond to readings taken when some number of LWBS are in the waiting room; black dots are everything else. Luckily, this criterion nicely captures all the non-Surge instances of high Worst Wait. 
+
+```{r echo = FALSE, warning = FALSE}
+ggplot(rsched[rsched$NILWBS == 0,], aes(OccRate, WorstWait)) + geom_point() + geom_point(data = rsched[rsched$NILWBS > 0,], aes(OccRate, WorstWait), color = "blue")
+
+```
+
+I believe the the preceding two correlations are argument enough to accept the OccRate > 1.50 criterion as our formal Surge classifier. It is clear to me that the presence of an Occupancy Rate reading of over 1.50 is highly predictive of a changed distribution of Cumulative Frustration and Worst Wait. For Thoroughness' sake, I have included additional correlation analyses at the end: The correlation of Occupancy Rate to Worst LOS (obviously factors other than surge affect this greatly), as well as the correlation of Occupancy *Level* and Raw NIS to the three patient satisfaction metrics. 
+
+##Conclusion
+
+I believe that OccRate > 1.50 is the correct criterion to use to classify Surge days from non. Assuming this is true, I can then use the ROCR package to calculate ROC curves for the various prediction methods available. Below, I demonstrate the control scenario, in which the existence of an Occupancy reading over 1.50 is used to predict a Surge in that day. 
+
+
+```{r ROC-on, echo = TRUE}
+
+preds = ddply(rsched, ~Day, function(x) c(Surge = length(unique(x$Day[x$OccRate >= 1.50]))))
+labls = preds 
+pred_obj <- prediction(predictions = preds[,"Surge"], labels = labls[, "Surge"])
+perf <- performance(pred_obj, measure = "tpr", x.measure = "fpr")
+plot(perf, col = rainbow(10))
+
+##I think this package works by finding the probability distribution of both the predictions and labels (true ## vals) of the classifier. This is one of two ways to generate the curve, and I suspect that the alternative ##method is better. My thinking: Only ~60 samples (about 2 months of days) is relatively few to specify the ##cumulative probability functions of the predictions and labels. Is this so? 
+``` 
+
+##Next Steps
+
+The main limitation in framing Surge Planning as a classification problem is that it cannot answer the question "how much advance notice will these predictions give me." However, it is still helpful that the code above can answer the question "how well does my prediction identify a surge in a given day". I would like to first answer this question for the handful of prediction algorithms that were proposed in a previous update. Then, I would like to take the subset of predictions that perform satisfactorily (to be defined later via comparison), and evaluate them using the previously-suggested, regression-type technique.
+
+In addition to those predictors discussed in a previous update, I would  add two more:
+
+1. Claim positive at the point where Occupancy Rate exceeds 1.5. This measure will be the control scenario, and a representation of present ED practice.
+
+2. Population Based Models: This predictor will rely on real-time calculation of the number of people in ED beds and overflow areas (the numerator of OccRate). This number will be divided by the average NIS at this time, based on a weekly cycle, and use either for a regression-based forecast or for a real-time, threshold-based prediction.
+
+##Appendix: Correlation Analyses
+
+```{r Appendix, echo = FALSE, warning = FALSE}
+
+##OccRate, LongestLOS
+cor.test(rsched$OccRate, rsched$LongestLOS)
+ggplot(rsched, aes(OccRate, LongestLOS)) + geom_point() + facet_grid(.~Surge)
+ggplot(rsched[rsched$Surge == "Surge",], aes(OccRate, LongestLOS)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(OccRate, LongestLOS))
+
+##OccLevel
+cor.test(rsched$OccLevel, rsched$CumWait)
+ggplot(rsched, aes(OccLevel, CumWait)) + geom_point() + facet_grid(.~Surge)
+ggplot(rsched[rsched$Surge == "Surge",], aes(OccLevel, CumWait)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(OccLevel, CumWait))
+
+cor.test(rsched$OccLevel, rsched$WorstWait)
+ggplot(rsched, aes(OccLevel, WorstWait)) + geom_point() + facet_grid(.~Surge)
+ggplot(rsched[rsched$Surge == "Surge",], aes(OccLevel, WorstWait)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(OccLevel, WorstWait))
+
+cor.test(rsched$OccLevel, rsched$LongestLOS)
+ggplot(rsched, aes(OccLevel, LongestLOS)) + geom_point() + facet_grid(.~Surge)
+ggplot(rsched[rsched$Surge == "Surge",], aes(OccLevel, LongestLOS)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(OccLevel, LongestLOS))
+
+##NIS
+cor.test(rsched$NIS, rsched$CumWait)
+ggplot(rsched, aes(NIS, CumWait)) + geom_point() + facet_grid(.~Surge)
+ggplot(rsched[rsched$Surge == "Surge",], aes(NIS, CumWait)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(NIS, CumWait))
+
+cor.test(rsched$NIS, rsched$WorstWait)
+ggplot(rsched, aes(NIS, WorstWait)) + geom_point() + facet_grid(.~Surge)
+ggplot(rsched[rsched$Surge == "Surge",], aes(NIS, WorstWait)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(NIS, WorstWait))
+
+cor.test(rsched$NIS, rsched$LongestLOS)
+ggplot(rsched, aes(NIS, LongestLOS)) + geom_point() + facet_grid(.~Surge)
+ggplot(rsched[rsched$Surge == "Surge",], aes(NIS, LongestLOS)) + geom_point(color = "red") + geom_point(data = rsched[rsched$Surge == "No Surge",], aes(NIS, LongestLOS))
+```

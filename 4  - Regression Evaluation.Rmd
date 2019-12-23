@@ -1,0 +1,562 @@
+---
+title: "Regression Evaluation"
+author: "Jack Rossi"
+date: "May 29th 2017"
+output: html_document
+---
+As a follow up to the previous classification problem evaluation, I want to extend the analysis to be able to address the question: "given a level of accuracy, how far in advance can we expect to know about a coming surge?" I will attempt this through a couple of methods: By systematically visualizing our surge predictions in comparison to the actual historical records in our test data; and by developing measures to address this question, for example the average time difference between a forecast indicating surge and the actual onset of surge. If these methods prove to be insufficient, I can move on to development of Activity monitoring ROC curves, an evaluation preferred by Hoot et al. 
+
+```{r setup, include=FALSE}
+library("ggplot2")
+library("grid")
+library("plyr")
+library("ROCR")
+library("knitr")
+
+get_rooms <- function(hour){
+  
+  if(hour%%24 >= 0){
+    hour = hour%%24
+    }
+  
+  if(hour %in% c(11,12,13,14,15,16,17,18,19,20,21,22,23,24,0)){
+    Rooms = 42}
+  else if (hour == 1){
+    Rooms = 32}
+  else if (hour %in% c(2, 3)){
+    Rooms = 25}
+  else if (hour %in% c(4, 5, 6, 7, 8)){
+    Rooms = 22} 
+  else if (hour == 9){
+    Rooms = 26}
+  else if (hour == 10){
+    Rooms = 36}
+  else {
+    Rooms = NA}
+  
+  return(Rooms)
+}
+
+get_FC_rooms <- function(hrBlock, minBlock, FCHours = 2){
+  #Sum up the number available rooms in the next FChours, weighted by the time spent with those rooms
+  if (FCHours == 1){return(get_rooms(hrBlock))
+  }
+  FCRooms = 0
+  
+  for (g in 1:FCHours){
+    FCRooms = FCRooms + get_rooms(hrBlock + g - 1)*(60-minBlock) + get_rooms(hrBlock + g)*minBlock  
+  }
+  FCRooms = FCRooms/(60*FCHours)
+}
+
+# Multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+#loading data; formatting date objects
+
+ED <- read.csv("ALL_DATA.csv", header = TRUE)
+
+colnames(ED)[1] = "Encounter.ID"
+ED$Arrival <- as.POSIXct(ED$Arrival, format = "%m/%d/%Y %I:%M %p")
+ED$ED.Room.Time <- as.POSIXct(ED$ED.Room.Time, format = "%m/%d/%Y %I:%M %p")
+ED$Time.Left.ED <- as.POSIXct(ED$Time.Left.ED, format = "%m/%d/%Y %I:%M %p ") 
+ED$Rapid.Triage.Complete.Time <- as.POSIXct(ED$Rapid.Triage.Complete.Time, format = "%m/%d/%Y %I:%M %p")
+```
+
+```{r formatdata, include = FALSE}
+#often there are multiple rows for a single patient
+ED <- ED[!duplicated(ED$Encounter.ID),]
+
+# creating a dataframe for training data that will be used to fill prototypical dataframe. 
+st <- as.POSIXct("2016-12-4 07:00")
+et <- as.POSIXct("2017-1-29 07:00")
+ev <- seq(from = 0, to = as.integer(difftime(et, st, units = "secs")), by = 60*10)
+sched <- data.frame(st + ev)
+colnames(sched)[1] <- "Time"
+
+#extract key time elements
+sched$wkday <- weekdays(sched$Time)
+sched$hour <- as.POSIXlt(sched$Time)$hour
+sched$min <- as.POSIXlt(sched$Time)$min
+
+#loop through all times in the schedule and calculate NIS, # Rooms
+for (m in 1:length(sched$Time)){
+  WholeED <- ED[!is.na(ED$Arrival) & !is.na(ED$Time.Left.ED) & !is.na(ED$ED.Room.Time) & 
+      ED$Arrival <= sched$Time[m] & ED$Time.Left.ED > sched$Time[m],]
+  sched$NIS[m] <- length(WholeED$Encounter.ID)
+  sched$Rooms[m] <- get_rooms(as.POSIXlt(sched$Time[m])$hour)
+  sched$FCRooms[m] <- get_FC_rooms(as.POSIXlt(sched$Time[m])$hour, as.POSIXlt(sched$Time[m])$min)
+}
+
+#calculate Occupancy Rate
+sched$OccRate <- sched$NIS/sched$Rooms
+sched$FCOccRate <- sched$NIS/sched$FCRooms
+
+#creating dataframe of prototypical week and filling it with average occupancy
+pst <- as.POSIXct("2017-1-1 07:00")
+pev <- seq(from = 0, to = 7*24*60*60-1, by = 60*10)
+prt <- pst + pev
+ptyp <- data.frame(prt)
+
+colnames(ptyp)[1] <- "Time"
+ptyp$wkday <- weekdays(ptyp$Time)
+
+for (i in 1:length(ptyp$Time)){
+  day <- ptyp$wkday[i]
+  hour <- as.POSIXlt(ptyp$Time[i])$hour
+  min <- as.POSIXlt(ptyp$Time[i])$min
+  
+  #collect all "extended ED" in training data corresponding to a weekday-hour-minute
+  ext <- sched[sched$wkday == day & sched$hour == hour & sched$min ==   min,]
+
+  #record summary statistics of extended ED
+  ptyp$avgNIS[i] <- mean(ext$NIS)
+  ptyp$avgOcc[i] <- mean(ext$OccRate)
+  ptyp$avgFCOcc[i] <- mean(ext$OccRate)
+  ptyp$N[i] <- length(ext$Time)
+  
+}
+
+#fixing time zone attribute for visualization
+attr(ptyp$Time, "tzone") <- "EST"
+
+#create dataframe for test data occupancy readings
+tst <- as.POSIXct("2017-1-29 07:00")
+tet <- as.POSIXct("2017-3-26 07:00")
+tev <- seq(from = 0, to = as.integer(difftime(tet, tst, units = "secs")), by = 60*10)
+testdata <- data.frame(tst + tev)
+
+colnames(testdata)[1] <- "Time"
+
+testdata$dday <- as.POSIXlt(testdata$Time)$yday
+testdata$wkday <- weekdays(testdata$Time)
+testdata$hr <- as.POSIXlt(testdata$Time)$hour
+testdata$min <- as.POSIXlt(testdata$Time)$min
+
+testdata$dday[testdata$hr >= 7] <- testdata$dday[testdata$hr >= 7] + 1
+
+for (m in 1:length(testdata$Time)){
+  WholeED <- ED[!is.na(ED$Arrival) & !is.na(ED$Time.Left.ED) & !is.na(ED$ED.Room.Time) & 
+      ED$Arrival <= testdata$Time[m] & ED$Time.Left.ED > testdata$Time[m],]
+  testdata$NIS[m] <- length(WholeED$Encounter.ID)
+  testdata$Rooms[m] <- get_rooms(testdata$hr[m])
+  testdata$FCRooms[m] <- get_FC_rooms(testdata$hr[m], testdata$min[m])
+}
+
+testdata$OccRate <- testdata$NIS/testdata$Rooms
+testdata$FCOccRate <- testdata$NIS/testdata$FCRooms
+
+attr(testdata$Time, "tzone") <- "EST"
+```
+
+```{r delta, include = FALSE}
+delta <- data.frame(ptyp$Time)
+colnames(delta)[1] <- "Time"
+delta$wkday <- weekdays(delta$Time)
+
+
+for (g in 1:length(ptyp$Time)){
+  delta$dNIS[g] = ptyp$avgNIS[g+1] - ptyp$avgNIS[g]
+  delta$dOcc[g] = ptyp$avgOcc[g+1] - ptyp$avgOcc[g]
+  delta$dFCOcc[g] = ptyp$avgFCOcc[g+1] - ptyp$avgFCOcc[g]
+}
+
+delta$dNIS[length(delta$dNIS)] <- 0
+delta$dOcc[length(delta$dOcc)] <- 0
+delta$dFCOcc[length(delta$dFCOcc)] <- 0
+
+attr(delta$Time, "tzone") <- "EST"
+#deltaref <- data.frame(Time = strftime(delta$Time, format = "%A %R"), 
+#                       dOcc = delta$dOcc, dFCOcc = delta$dFCOcc)
+#write.csv(deltaref, file = "~/Documents/Research CHP/delta.csv")
+```
+
+```{r forecast_12}
+testdata$PredOcc_2hr <- NA
+
+#loop through the unique days in the data - two inner loops will first find max OccRate in a day, and then #fill in the OccRate predictions based on the location and value of that maximum
+for (m in min(testdata$dday):max(testdata$dday)){
+  #and through each data point contained in those days
+  for (n in which(testdata$dday == m)){
+    #do nothing to the first 22 data points in the data set: else the equation below would throw an error
+    if (n < 23){
+    
+    }
+    else if(testdata$OccRate[n] == max(testdata$OccRate[testdata$dday==m])){
+      testdata$PredOcc_2hr[n-11] <- testdata$OccRate[n-11]
+      break
+    } 
+  }
+  for (n in which(testdata$dday == m)){
+    if (n == 1){
+    ##do nothing  
+    }
+    else if((!is.na(testdata$PredOcc_2hr[n-1])) & testdata$dday[n-1] == testdata$dday[n]){
+    testdata$PredOcc_2hr[n] <- testdata$PredOcc_2hr[n-1] +
+      delta$dOcc[delta$wkday == testdata$wkday[n-1] & 
+                 as.POSIXlt(delta$Time)$hour == testdata$hr[n-1] &
+                 as.POSIXlt(delta$Time)$min == testdata$min[n-1]]
+    }
+  }
+  
+}
+
+
+```
+
+```{r forecast_20}
+testdata$PredFCOcc_1hr <- NA
+
+#loop through the unique days in the data - two inner loops will first find max OccRate in a day, and then #fill in the OccRate predictions based on the location and value of that maximum
+for (m in min(testdata$dday):max(testdata$dday)){
+  #and through each data point contained in those days
+  for (n in which(testdata$dday == m)){
+    #do nothing to the first 11 data points in the data set: else the equation below would throw an error
+    if (n < 6){
+    
+    }
+    else if(testdata$OccRate[n] == max(testdata$OccRate[testdata$dday==m])){
+      testdata$PredFCOcc_1hr[n-5] <- testdata$FCOccRate[n-5]
+      break
+    } 
+  }
+  for (n in which(testdata$dday == m)){
+    if (n == 1){
+    ##do nothing  
+    }
+    else if(!is.na(testdata$PredFCOcc_1hr[n-1]) & testdata$dday[n-1] == testdata$dday[n]){
+    testdata$PredFCOcc_1hr[n] <- testdata$PredFCOcc_1hr[n-1] +
+                                  delta$dFCOcc[delta$wkday == testdata$wkday[n-1] & 
+                                        as.POSIXlt(delta$Time)$hour == testdata$hr[n-1] &
+                                        as.POSIXlt(delta$Time)$min == testdata$min[n-1]]
+    }
+  }
+  
+}
+
+```
+
+```{r forecast_18}
+testdata$PredFCOcc_2hr <- NA
+
+#loop through the unique days in the data - two inner loops will first find max OccRate in a day, and then #fill in the OccRate predictions based on the location and value of that maximum
+for (m in min(testdata$dday):max(testdata$dday)){
+  #and through each data point contained in those days
+  for (n in which(testdata$dday == m)){
+    #do nothing to the first 22 data points in the data set: else the equation below would throw an error
+    if (n < 12){
+    
+    }
+    else if(testdata$OccRate[n] == max(testdata$OccRate[testdata$dday==m])){
+      testdata$PredFCOcc_2hr[n-11] <- testdata$FCOccRate[n-11]
+      break
+    } 
+  }
+  for (n in which(testdata$dday == m)){
+    if (n == 1){
+    ##do nothing  
+    }
+    else if((!is.na(testdata$PredFCOcc_2hr[n-1])) & testdata$dday[n-1] == testdata$dday[n]){
+    testdata$PredFCOcc_2hr[n] <- testdata$PredFCOcc_2hr[n-1] +
+      delta$dFCOcc[delta$wkday == testdata$wkday[n-1] & 
+                 as.POSIXlt(delta$Time)$hour == testdata$hr[n-1] &
+                 as.POSIXlt(delta$Time)$min == testdata$min[n-1]]
+    }
+  }
+  
+}
+```
+
+A plot was created for each day in the test data, showing the progression of Occupancy Readings versus the supposed progression as captured by our forecast. Additional examples of these plots are listed in the appendix. I will highlight a few that are representative of the group. 
+
+```{r makeplots, echo = TRUE}
+plots = list()
+positives = unique(testdata$dday[testdata$OccRate >= 1.50])
+for (b in positives ){
+   plots[[b]] = ggplot(testdata[testdata$dday == b,], aes(Time, OccRate)) +
+     geom_area(fill =   "blue")  +
+     geom_step(aes(Time, PredOcc_2hr), na.rm = TRUE, color = "orange")+ ylim(0, 2.0) + ggtitle(b)
+
+}
+
+neg_plots = list()
+negatives = setdiff(unique(testdata$dday), positives)
+for (a in negatives){
+   neg_plots[[a]] = ggplot(testdata[testdata$dday == a,], aes(Time, OccRate)) +
+     geom_area(fill =   "blue")  +
+     geom_step(aes(Time, PredOcc_2hr), na.rm = TRUE, color = "orange")+ ylim(0, 1.6) + ggtitle(b)
+
+}
+
+
+plots[[30]] #example of ideal
+```
+
+This first plot gives the ideal relation between the forecasted and actual time series. As the shaded blue area shows, the Occupancy of the ED progresses through the day in a relatively smooth, inverted U shape. At about 19:00, two hours before the true maximum, the progression is forecasted in orange, and as it proceeds past 20:00, it accurately projects the time at which the ED will reach Surge status. Unfortunately, very few of the forecasts are this clean. Worse, several of the plots reveal 3 key issues with our current modelling procedure. 
+
+```{r}
+plots[[84]] #example of late night surge carry-over
+```
+
+The 84th day of the year shows a characteristically unpredictable Occupancy progression, as well as a commom problem with forecasting for the daily maximum; As a whole, March 25th into the 26th was a slow day. We should be forecasting for the peak that occurs around Mar 25 22:00, but my model identifies the true maximum as a remnant from the previous day (a surge was called), and ceases to make a redundant forecast. 
+
+```{r}
+plots[[53]] #example of redundant maximum 
+```
+
+The 53rd day of the year shows another problem with forecasting for the maximum: In this case and in several others, the timing of the maximum occupancy is a moot point, since the ED already achieved Surge status about 6 hours earlier, around 19:00. To fix this problem, we should forecast for the daily maximum, OR the first daily instance of Occupancy over 1.50, whichever comes first. 
+
+```{r}
+plots[[51]] #example of same-day, distinct surge risks 
+
+```
+
+This day of data suggests we should perhaps go further. I should note that in this case we accurately forecast that the daily maximum will approach, though not exceed, our threshold of 1.50. However, it appears that we have neglected a serious and distinct surge threat that occurred earlier in the day, as the rapid filling of the ED around noon shows. 
+
+I believe there is a solution to these problems that also solves another - scarcity of classification data. As the jagged ROC curves from the last update show, there are only a few thresholds for us to choose from when designing our desired TPR and FPR. This is due to the fact that we are classifying each of the 45 days in the test data as either Surge or Not. 
+
+First, I propose that we look for Surge threats only in the hours between 12 noon and the following 7am. I believe this timing captures the onset of most, if not all Surge events. From an operational standpoint, I also believe that we should not have the Clinical Lead initiating huddles in off-peak hours. This change should eliminate the surge carry-over problem. 
+
+Next, I would like to forecast for the earliest of either the maximum occupancy rate, or the first instance of Occupancy above 1.50. This should be a relatively simple fix to the problem of the redundant maximum. 
+
+Finally, I believe we need a more complex solution to the problem of same-day, distinct surge threats. First, we break down the surge window (12p-7a) into 2-hour intervals, in which we consider whether the maximum occupancy will exceed 1.50. Each interval in which it doesn't is classified as a Non-surge, and becomes its own data point in our ROC analysis. If the two hour block does, it and the next three blocks will be considered a single surge event, and it too will become a data point in our ROC analysis. The average Surge activation in February and March was 7.013 hours. I chose to round this up to 8 so that it is divisible by 2.  
+
+In the following, I will develop the logic to achieve these fixes. I will then repeat the previous plotting to identify any further problems, and finish the analysis with revised ROC plots. 
+
+```{r make_blocks, warning=FALSE}
+testdata$block = NA
+
+#make blocks
+for (k in which(testdata$hr %in% c(12,13,14,15,16,17,18,19,20,21,22,23,0,1,2,3,4,5,6))){
+  testdata$block[k] <- paste(testdata$dday[k], testdata$hr[k]-testdata$hr[k]%%2)
+}
+
+#modify blocks
+blocks = unique(testdata$block)
+for (j in 2:length(blocks))
+{
+  if (max(testdata$OccRate[testdata$block == blocks[j]], na.rm= TRUE) >= 1.50){
+    
+    inc = 1 #increment
+    while(substr(blocks[j+inc], 4, 5) != "12" & inc <= 3)
+    {
+      testdata$block[testdata$block == blocks[j+inc]] <- blocks[j]
+      inc = inc + 1
+    }
+  }
+}
+
+#check 
+blockplots = list()
+days = unique(testdata$dday)
+for (b in days){
+   blockplots[[b]] = ggplot(testdata[testdata$dday == b,], aes(Time, OccRate)) +
+     geom_area(fill =   "blue")  + facet_wrap(~block) + theme(axis.text.x = element_blank())
+}
+
+```
+A visual of the blocking of the data is shown in an appendix. Having the data separated as such, we then want to reapply the forecast. The following code will develop this extended forecast, and a visualization of the results will follow.
+
+```{r forecast_12+}
+testdata$PredOcc_2hr <- NA
+
+
+#cycle through each time block
+for (m in unique(testdata$block[!is.na(testdata$block)])){
+  #establish conditional for contents of time block, for brevity
+  condition = testdata$block == m & !is.na(testdata$block)
+  #if this block contains first surge or daily maximum
+  for (n in which(condition)){
+    if (n == min(which(condition))){
+      testdata$PredOcc_2hr[n] <- testdata$OccRate[n]
+    }
+    else{
+      testdata$PredOcc_2hr[n] <- testdata$PredOcc_2hr[n-1] +
+      delta$dOcc[delta$wkday == testdata$wkday[n-1] & 
+                 as.POSIXlt(delta$Time)$hour == testdata$hr[n-1] &
+                 as.POSIXlt(delta$Time)$min == testdata$min[n-1]]
+    }
+  }  
+}      
+
+plots12 = list()
+for (a in unique(testdata$dday)){
+   plots12[[a]] = ggplot(testdata[testdata$dday == a,], aes(Time, OccRate)) +
+     geom_area(fill =   "blue")  +
+     geom_step(aes(Time, PredOcc_2hr), na.rm = TRUE, color = "orange") + 
+     facet_wrap(~block) + theme(axis.text.x = element_blank())
+}
+
+labs = ddply(testdata[!is.na(testdata$block),], ~block, function(x) c(Surge = length(unique(x$dday[x$OccRate >= 1.50]))))
+preds =  ddply(testdata[!is.na(testdata$block),], ~block, function(x) c(max_Occ = max(x$PredOcc_2hr, na.rm = TRUE)))
+pred_obj <- prediction(predictions = preds[,"max_Occ"], labels = labs[, "Surge"])
+perf <- performance(pred_obj, measure = "tpr", x.measure = "fpr")
+plot(perf, colorize =  TRUE)
+slot(performance(pred_obj, measure = "auc"), "y.values")[[1]]
+
+thresh12 <- data.frame("Thresholds" = slot(perf, "alpha.values")[[1]], "FPR" =
+                       slot(perf, "x.values")[[1]], "TPR" = slot(perf, "y.values")[[1]])
+
+
+num_negs <- length(labs$Surge) - sum(labs$Surge)
+thresh12$norm_fpr <- thresh12$FPR * num_negs /(length(unique(testdata$dday))/7)
+thresh12$Calls_Per_Week <- (thresh12$FPR * num_negs + thresh12$TPR *
+                              sum(labs$Surge)) / (length(unique(testdata$dday))/7)
+
+diffs <- ddply(testdata[!is.na(testdata$block),], ~block, function(x) c(diff = difftime(x$Time[x$OccRate >= 1.50][1], x$Time[1], unit = "min")))
+
+pred_diffs <- diffs[preds$max_Occ >= 1.366,]
+mean(pred_diffs$diff, na.rm = TRUE)
+
+```
+
+I believe these results to be of high quality. An AUC of .9804 is remarkable. In practice, I would recommend that we choose the threshold of 1.366. This means that at each bi-hourly huddle, we would immediately call in the Surge team if at any point in the next two hours, our forecast suggested that the Occupancy would exceed 1.366. If we adopted this protocol for the time captured in our test data, our TPR would be .897; our FPR would be .0377, and we would call in the Surge team 50.7 minutes before each Surge, on average. 
+
+```{r forecast_18+}
+testdata$PredFCOcc_2hr <- NA
+
+
+#cycle through each time block
+for (m in unique(testdata$block[!is.na(testdata$block)])){
+  #establish conditional for contents of time block, for brevity
+  condition = testdata$block == m & !is.na(testdata$block)
+  #for all times in this block
+  for (n in which(condition)){
+    #if this is the first time
+    if (n == min(which(condition))){
+      #the prediction is the current FC Occupancy
+      testdata$PredFCOcc_2hr[n] <- testdata$FCOccRate[n]
+    }
+    else{
+      testdata$PredFCOcc_2hr[n] <- testdata$PredFCOcc_2hr[n-1] +
+      delta$dFCOcc[delta$wkday == testdata$wkday[n-1] & 
+                 as.POSIXlt(delta$Time)$hour == testdata$hr[n-1] &
+                 as.POSIXlt(delta$Time)$min == testdata$min[n-1]]
+    }
+  }  
+}      
+
+plots18 = list()
+for (a in unique(testdata$dday)){
+   plots18[[a]] = ggplot(testdata[testdata$dday == a,], aes(Time, OccRate)) +
+     geom_area(fill =   "blue")  +
+     geom_step(aes(Time, PredOcc_2hr), na.rm = TRUE, color = "orange") + 
+     facet_wrap(~block) + theme(axis.text.x = element_blank())
+}
+
+labs = ddply(testdata[!is.na(testdata$block),], ~block, function(x) c(Surge = length(unique(x$dday[x$OccRate >= 1.50]))))
+preds =  ddply(testdata[!is.na(testdata$block),], ~block, function(x) c(max_FCOcc = max(x$PredFCOcc_2hr, na.rm = TRUE)))
+pred_obj <- prediction(predictions = preds[,"max_FCOcc"], labels = labs[, "Surge"])
+perf <- performance(pred_obj, measure = "tpr", x.measure = "fpr")
+plot(perf, colorize =  TRUE)
+slot(performance(pred_obj, measure = "auc"), "y.values")[[1]]
+
+thresh18 <- data.frame("Thresholds" = slot(perf, "alpha.values")[[1]], "FPR" =
+                       slot(perf, "x.values")[[1]], "TPR" = slot(perf, "y.values")[[1]])
+
+num_negs <- length(labs$Surge) - sum(labs$Surge)
+thresh18$norm_fpr <- thresh18$FPR * num_negs /(length(unique(testdata$dday))/7)
+thresh18$Calls_Per_Week <- (thresh18$FPR * num_negs + thresh18$TPR *
+                              sum(labs$Surge)) / (length(unique(testdata$dday))/7)
+
+diffs <- ddply(testdata[!is.na(testdata$block),], ~block, function(x) c(diff = difftime(x$Time[x$OccRate >= 1.50][1], x$Time[1], unit = "min")))
+
+pred_diffs <- diffs[preds$max_FCOcc >= 1.366,]
+mean(pred_diffs$diff, na.rm = TRUE)
+
+
+```
+As we saw in a previous update, the results for using Forecasted Occupancy Rate as a predictor fare even better. Though the distribution of FC Occ differs from normal Occupancy, 1.366 is again my choice for threshold. At this level, we would expect to have an FPR of .0466 and a TPR of .931; We also call in the Surge team 51.5 minutes before a Surge on average. 
+
+This work represents an improved, if yet imperfect model of a possible implementation of Surge prediction. In practice, the blocking of Time would rarely occur at perfect 2 hour intervals. Though I do not expect this complication to change our results much, it is still one limitation of the model. 
+
+Further changes to this model may be necessitated by practical considerations. For instance, huddling every two hours for 17 hours a day may be too great a time commitment. To mitigate this time loss, we could either change the huddle frequency, perhaps to every 3 hours, or change the Surge window, perhaps to 2pm-4am. In any case, I believe that the value of *some* forecasting operation as illustrated here or previously is beyond contention. What must follow is a series of conversations with the ED leadership to identify what they want from Surge prediction, and what sort of process can be reasonably implemented to provide those wants in a sustainable manner.    
+
+##Update: Normalized FPR and Threshold Decision
+
+In order to refine the choice of surge threshold, I normalized the False Positive Rate by week. This changes the picture of performance at a 1.366 threshold greatly. This threshold would translate to nearly 3 false positives per week! When viewing FPR in this fashion, it seems more important to limit these cost drivers than to assure that we catch all Surges early - Surges that we don't catch early are the same as if we had kept the old system. 
+
+In my opinion, this revelation changes the best option to Forecast 12+ (changing from the Modified Occupancy to now the normal Occupancy) and a threshold of 1.414. So, if at any time the Unit Clerk makes a forecast, and the tool returns a value of 1.414 or greater, the Surge team should be called immediately. Using the tool this way will give 48.6 minutes of advanced notice on average, catching 72% of Surges early. I chose this threshold by fixing the normalized FPR at 1 per week, which I assumed to be the maximum allowable rate. If 1 per week seems high, consider that this is inlcuded in the overall Surge call rate of 3.56 per week. In 2017 the actual number of call-ins over this time period was 16, a rate of `r 16/(28+26)*7` surges per week. Also consider that a 'false alarm'  needn't be a superfluous activation; conditions in the ED at Occupancy 1.45 are hardly less worthy of additional help than at Occupancy 1.50. 
+
+More than likely, the decision of this threshold can be best made by the ED leadership team. The information provided here should be sufficient for a purely statistical perspective. I believe there to be further opportunity to enrich this decision process through simulation analyses, particularly looking at the cost of call-ins versus the benefit of earlier Surge MD action, perhaps as a function of patient waiting time.    
+
+##Appendix: Initial Forecast Plots
+
+```{r pos_plots}
+plots[positives]
+
+```
+
+#Appendix: Arrangement of Blocks
+
+```{r block_plots}
+blockplots[29:35]
+```
+
+##Appendix: Forecast 12+, Select Plots
+```{r}
+plots12[29:35]
+```
+
+##Appendix: Forecast 18+, Select Plots
+
+```{r}
+plots18[29:35]
+```
+
+##Appendix: Predictor Thresholds and Performance Measures
+
+```{r}
+kable(thresh12[10:30,], caption = "Forecast 12+ Select Threshold List")
+
+kable(thresh18[10:30,], caption = "Forecast 18+ Select Threshold List")
+```
+
+##Appendix: Visualization, True Positive Day, 100 minutes notice
+
+```{r}
+ggplot(testdata[testdata$dday == 30,], aes(Time, OccRate)) + geom_area(fill = "blue") + geom_step(data = testdata[testdata$dday == 30 & testdata$block == "30 18",], aes(Time, PredOcc_2hr), color = "orange") + geom_rect(xmin = as.numeric(as.POSIXct("2017-1-30 18:00")), xmax = as.numeric(as.POSIXct("2017-1-30 19:40")), ymin = -Inf, ymax = Inf, alpha = .005, fill = "green")
+```
